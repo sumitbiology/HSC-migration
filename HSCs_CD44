@@ -1,0 +1,222 @@
+# ==========================================
+# 1. MODEL PARAMETERS & DOMAIN SETUP
+# ==========================================
+
+# Grid and Time settings
+Nx, Ny = 50, 50           # Grid size (50x50 cells)
+Lx, Ly = 1.0, 1.0         # Physical dimensions (mm)
+dx, dy = Lx/Nx, Ly/Ny     # Cell size
+T_final = 2.0             # Total simulation time
+dt = 0.001                # Time step (stability condition: dt < dx^2 / 4*D)
+Nt = int(T_final / dt)    # Number of time steps
+
+# Coordinates
+x = np.linspace(dx/2, Lx-dx/2, Nx)
+y = np.linspace(dy/2, Ly-dy/2, Ny)
+X, Y = np.meshgrid(x, y)
+
+# Biological Parameters
+Du = 0.01      # Random motility of HSCs
+Dc = 0.1       # Diffusion of Chemoattractant (EpCAM/MUC1/Claudin-7)
+chi0 = 0.15    # Base chemotactic sensitivity
+alpha = 0.5    # CD44 upregulation rate
+beta = 0.2     # CD44 shedding rate
+k_on = 10.0    # Binding affinity at tumor surface
+k_off = 0.1    # Detachment rate
+B_max = 10.0   # Maximum binding capacity of tumor sites
+
+# Initial Conditions
+u = np.zeros((Ny, Nx))    # HSC Density (free)
+c = np.zeros((Ny, Nx))    # Chemoattractant Concentration
+rho = np.zeros((Ny, Nx))  # CD44 Receptor Density on HSCs
+b = np.zeros(Nx)          # Bound HSCs on the Tumor Boundary (Top Edge)
+
+# Set initial blob of HSCs at the bottom (Far-field/Blood Vessel)
+u[0:5, :] = 1.0 
+rho[0:5, :] = 0.1 # Low initial CD44 expression
+
+# ==========================================
+# 2. TUMOR HETEROGENEITY (YOUR HYPOTHESIS)
+# ==========================================
+# We define the top boundary (y=Ly) as the Tumor Margin.
+# psi represents Tumor CD44 positivity: 0.8 for CSCs, 0.6 for Bulk.
+
+psi = np.zeros(Nx)
+# Middle section acts as Cancer Stem Cell (CSC) niche
+csc_start, csc_end = int(0.4*Nx), int(0.6*Nx)
+
+psi[:] = 0.6          # Bulk Cancer (60% CD44+)
+psi[csc_start:csc_end] = 0.8  # CSC Niche (80% CD44+) - The "Hotspot"
+
+# ==========================================
+# 3. HELPER FUNCTIONS
+# ==========================================
+
+def update_chemoattractant(c, u, dt):
+    """
+    Solves Diffusion-Reaction for soluble factors (c).
+    Source: Tumor boundary (Top). Sink: Consumption by HSCs.
+    """
+    # Diffusion (Central Difference)
+    laplacian = (np.roll(c, 1, axis=1) + np.roll(c, -1, axis=1) + 
+                 np.roll(c, 1, axis=0) + np.roll(c, -1, axis=0) - 4*c) / dx**2
+    
+    # Boundary Conditions (Neumann 0 everywhere except Source at Top)
+    # Top boundary acts as source (Tumor secreting EpCAM/MUC1)
+    # We impose a fixed flux or value at the top ghost cells
+    source_term = np.zeros_like(c)
+    source_term[-1, :] += 5.0 # Production at tumor margin
+    
+    # Reaction: Consumption by HSCs (-gamma * u * c)
+    gamma = 1.0
+    reaction = -gamma * u * c
+    
+    return c + dt * (Dc * laplacian + reaction + source_term)
+
+def update_hsc_transport(u, c, rho, dt):
+    """
+    Solves Advection-Diffusion for HSCs (u).
+    Uses Upwind Scheme for chemotaxis to preserve positivity.
+    """
+    # 1. Calculate Gradients of Chemoattractant (Central Diff)
+    grad_cx = (np.roll(c, -1, axis=1) - np.roll(c, 1, axis=1)) / (2*dx)
+    grad_cy = (np.roll(c, -1, axis=0) - np.roll(c, 1, axis=0)) / (2*dy)
+    
+    # 2. Calculate Effective Chemotactic Velocity: v = chi(rho) * grad_c
+    # Sensitivity depends on receptor density rho! (Plasticity)
+    chi_eff = chi0 * rho 
+    vx = chi_eff * grad_cx
+    vy = chi_eff * grad_cy
+    
+    # 3. Upwind Advection Fluxes
+    # Flux X
+    F_adv_x = np.zeros_like(u)
+    flow_right = (vx > 0)
+    flow_left = (vx < 0)
+    F_adv_x[:, :-1] = (flow_right[:, :-1] * u[:, :-1] * vx[:, :-1] + 
+                       flow_left[:, :-1] * u[:, 1:] * vx[:, :-1])
+    
+    # Flux Y
+    F_adv_y = np.zeros_like(u)
+    flow_up = (vy > 0)
+    flow_down = (vy < 0)
+    F_adv_y[:-1, :] = (flow_up[:-1, :] * u[:-1, :] * vy[:-1, :] + 
+                       flow_down[:-1, :] * u[1:, :] * vy[:-1, :])
+
+    # 4. Advection Update (Divergence of Flux)
+    adv_term = - ( (F_adv_x - np.roll(F_adv_x, 1, axis=1))/dx + 
+                   (F_adv_y - np.roll(F_adv_y, 1, axis=0))/dy )
+    
+    # 5. Diffusion Update
+    diff_term = Du * (np.roll(u, 1, axis=1) + np.roll(u, -1, axis=1) + 
+                      np.roll(u, 1, axis=0) + np.roll(u, -1, axis=0) - 4*u) / dx**2
+    
+    return u + dt * (diff_term + adv_term)
+
+# ==========================================
+# 4. MAIN SIMULATION LOOP
+# ==========================================
+
+print("Starting Simulation...")
+
+history_u = [] # Store frames for animation
+history_b = []
+
+for n in range(Nt):
+    
+    # A. Update Chemoattractant Field
+    c = update_chemoattractant(c, u, dt)
+    
+    # B. Update CD44 Receptor Density (Plasticity)
+    # Advection of rho follows cells + Reaction (Upregulation/Shedding)
+    # Simplified here to Reaction-Diffusion on the moving field for stability
+    rho_reaction = alpha * c - beta * rho
+    rho = rho + dt * rho_reaction
+    # Cap rho to realistic biological limits
+    rho = np.clip(rho, 0, 1.0) 
+    
+    # C. Update HSC Density (The Migration)
+    u_new = update_hsc_transport(u, c, rho, dt)
+    
+    # D. BOUNDARY DYNAMICS (The "Lock" Mechanism)
+    # Calculate flux hitting the top boundary (Tumor)
+    # Only cells in the top row (u[-1, :]) interact with the boundary
+    
+    # Rate of binding = k_on * Tumor_CD44(psi) * HSC_CD44(rho) * Free_Sites
+    binding_flux = k_on * psi * rho[-1, :] * u[-1, :] * (1 - b/B_max) * dt
+    detachment_flux = k_off * b * dt
+    
+    # Update Bound Cells (ODE)
+    b_new = b + binding_flux - detachment_flux
+    
+    # Remove bound cells from the free population in the top row
+    u_new[-1, :] -= binding_flux / dy # Convert flux to density change
+    
+    # Add detached cells back to free population
+    u_new[-1, :] += detachment_flux / dy
+    
+    u = np.maximum(u_new, 0) # Enforce positivity
+    b = np.maximum(b_new, 0)
+    
+    # Store frames every 100 steps
+    if n % 50 == 0:
+        history_u.append(u.copy())
+        history_b.append(b.copy())
+
+print("Simulation Complete.")
+
+# ==========================================
+# 5. VISUALIZATION
+# ==========================================
+
+fig = plt.figure(figsize=(12, 8))
+
+# Subplot 1: Migration Map (2D Heatmap)
+ax1 = fig.add_subplot(2, 2, 1)
+im1 = ax1.imshow(history_u[0], origin='lower', extent=[0, Lx, 0, Ly], 
+                 cmap='jet', vmin=0, vmax=np.max(history_u[-1]))
+ax1.set_title(f'HSC Migration (t=0)')
+ax1.set_xlabel('Tumor Width (mm)')
+ax1.set_ylabel('Distance to Tumor (mm)')
+fig.colorbar(im1, ax=ax1, label='Cell Density')
+
+# Subplot 2: Tumor Surface Accumulation (1D Line Plot)
+ax2 = fig.add_subplot(2, 2, 2)
+line, = ax2.plot(x, history_b[0], 'r-', linewidth=2)
+ax2.set_ylim(0, np.max(history_b)*1.1 if np.max(history_b) > 0 else 1)
+ax2.set_xlim(0, Lx)
+ax2.set_title('Accumulation on Tumor Surface')
+ax2.set_xlabel('Tumor Surface Position')
+ax2.set_ylabel('Bound HSC Density')
+ax2.fill_between(x, 0, 1, where=(x >= x[csc_start]) & (x <= x[csc_end]), 
+                 color='yellow', alpha=0.3, label='CSC Niche (80% CD44+)')
+ax2.legend()
+
+# Subplot 3: Final State (Static)
+ax3 = fig.add_subplot(2, 2, 3)
+ax3.imshow(history_u[-1], origin='lower', extent=[0, Lx, 0, Ly], cmap='jet')
+ax3.set_title(f'Final HSC Distribution (t={T_final})')
+ax3.set_xlabel('Tumor Width')
+
+# Subplot 4: Final Bound Profile (Static)
+ax4 = fig.add_subplot(2, 2, 4)
+ax4.plot(x, history_b[-1], 'r-', linewidth=2)
+ax4.set_title('Final Bound Population')
+ax4.set_xlabel('Position')
+# Highlight the CSC Peak
+ax4.annotate('CSC "Hotspot"\n(Higher Retention)', 
+             xy=(0.5, np.max(history_b[-1])), 
+             xytext=(0.7, np.max(history_b[-1])),
+             arrowprops=dict(facecolor='black', shrink=0.05))
+
+plt.tight_layout()
+plt.show()
+
+# (Optional) To save the animation, you would uncomment the following lines:
+# def animate(i):
+#     im1.set_array(history_u[i])
+#     ax1.set_title(f'HSC Migration (Frame {i})')
+#     line.set_ydata(history_b[i])
+#     return im1, line
+# anim = animation.FuncAnimation(fig, animate, frames=len(history_u), interval=50)
+# anim.save('tnbc_hsc_migration.mp4', writer='ffmpeg')
